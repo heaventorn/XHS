@@ -394,6 +394,37 @@ try {
     __iframeObserver.observe(document.documentElement, { childList: true, subtree: true });
 } catch(e){}
 
+// ===== 18. 字体指纹伪造（document.fonts.status = loaded）=====
+try {
+    if (document.fonts) {
+        Object.defineProperty(document.fonts, 'status', { get: function(){ return 'loaded'; }, configurable: true });
+    }
+} catch(e){}
+
+// ===== 19. 电池 API 伪造（插电+满电，桌面端典型状态）=====
+try {
+    if ('getBattery' in navigator) {
+        navigator.getBattery = function() {
+            return Promise.resolve({
+                charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1.0,
+                onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null,
+                addEventListener: function(){}, removeEventListener: function(){}, dispatchEvent: function(){ return true; }
+            });
+        };
+    }
+} catch(e){}
+
+// ===== 20. WebGL debug extension 伪造（与 getParameter 伪造保持一致）=====
+try {
+    var __glExt = WebGLRenderingContext.prototype.getExtension;
+    WebGLRenderingContext.prototype.getExtension = function(name) {
+        if (name === 'WEBGL_debug_renderer_info') {
+            return { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
+        }
+        return __glExt.call(this, name);
+    };
+} catch(e){}
+
 """
 
 
@@ -907,17 +938,27 @@ def search_keyword(page, keyword):
 
 
 def extract_note_content_with_disguise(context, note_url):
-    """逐条打开帖子详情页读正文，带真人浏览伪装（阅读停顿、随机滚动、鼠标移动）。
-    目的：增强反检测，让采集行为更像真人逐条浏览。失败返回空字符串。"""
+    """随机打开帖子详情页读正文，带真人浏览伪装。
+    强化反检测：超时缩短、风控页检测、分多步先快后慢滚动、随机停留。
+    失败或触发风控返回空字符串。"""
     detail_page = None
     try:
         detail_page = context.new_page()
         try:
-            detail_page.goto(note_url, wait_until="domcontentloaded", timeout=20000)
+            detail_page.goto(note_url, wait_until="domcontentloaded", timeout=12000)
         except Exception:
             return ""
 
-        # 等待正文加载（最多8秒）
+        # 风控检测：页面出现登录/验证/安全字样时立即退出并暂停
+        try:
+            page_text = detail_page.inner_text("body")[:500]
+            if any(kw in page_text for kw in ["登录", "验证", "安全验证", "操作频繁", "异常行为"]):
+                human_sleep((8.0, 15.0))
+                return ""
+        except Exception:
+            pass
+
+        # 等待正文加载（最多6秒）
         content_selectors = [
             "div#detail-desc",
             "div.note-content",
@@ -928,25 +969,38 @@ def extract_note_content_with_disguise(context, note_url):
             "div[class*='note-text']",
         ]
         try:
-            detail_page.wait_for_selector(", ".join(content_selectors), timeout=8000)
+            detail_page.wait_for_selector(", ".join(content_selectors), timeout=6000)
         except Exception:
             pass
 
         # ===== 伪装：真人阅读行为 =====
         # 1) 阅读停顿（模拟认真看正文）
-        human_sleep((2.0, 5.0))
-        # 2) 50%概率向下滚动一次（模拟看更多内容/评论区）
-        if random.random() < 0.5:
+        human_sleep((2.5, 6.0))
+        # 2) 随机滚动 0-2 次（分多步先快后慢，模拟真人滚动惯性）
+        scroll_times = random.randint(0, 2)
+        for _ in range(scroll_times):
             try:
-                detail_page.mouse.wheel(0, random.randint(300, 600))
-                human_sleep((1.0, 2.5))
+                total = random.randint(200, 500)
+                steps = random.randint(3, 6)
+                remaining = total
+                for si in range(steps):
+                    if si == steps - 1:
+                        step = remaining
+                    else:
+                        ratio = 1.0 - (si / steps) * 0.6
+                        step = int(remaining * ratio / (steps - si))
+                        remaining -= step
+                    detail_page.mouse.wheel(0, step)
+                    time.sleep(random.uniform(0.03, 0.08))
+                human_sleep((0.5, 1.5))
             except Exception:
                 pass
-        # 3) 鼠标随机移动（模拟浏览视线）
-        try:
-            move_mouse_human(detail_page)
-        except Exception:
-            pass
+        # 3) 60%概率鼠标随机移动（模拟浏览视线）
+        if random.random() < 0.6:
+            try:
+                move_mouse_human(detail_page)
+            except Exception:
+                pass
 
         # 读取正文（取最长的匹配）
         content = ""
@@ -973,7 +1027,7 @@ def extract_note_content_with_disguise(context, note_url):
             content = re.sub(r"\n{3,}", "\n\n", content).strip()
 
         # 关闭前再停顿一下（模拟看完了准备退出）
-        human_sleep((0.5, 1.5))
+        human_sleep((0.8, 2.0))
         return content
 
     except Exception:
@@ -1051,10 +1105,19 @@ def scroll_and_collect(page, context, keyword, max_count):
                         unknown_kept += 1
                         print(f"    提示：标题「{title[:20]}」发布时间[{publish_time or '未知'}]无法解析，默认保留")
 
-                # 逐条打开详情页读正文（伪装真人浏览，增强反检测）
-                note_content = extract_note_content_with_disguise(context, full_url)
-
+                # 先标记已处理（防止详情页打开异常导致重复打开同一个帖子）
                 seen_ids.add(note_id)
+
+                # 随机打开详情页（50%概率，模拟真人不会每条都点进去看）
+                note_content = ""
+                if random.random() < 0.5:
+                    note_content = extract_note_content_with_disguise(context, full_url)
+                    # 点开看完后随机停顿（模拟回味/思考）
+                    human_sleep((1.5, 4.0))
+                else:
+                    # 不点开时也停顿一下（模拟快速划过）
+                    human_sleep((0.8, 2.0))
+
                 collected.append({
                     "搜索关键词": keyword,
                     "账号名字": author_name,
@@ -1065,7 +1128,10 @@ def scroll_and_collect(page, context, keyword, max_count):
                     "发布时间": publish_time,
                 })
 
-                content_info = f"正文{len(note_content)}字" if note_content else "正文为空"
+                if note_content:
+                    content_info = f"已点开·正文{len(note_content)}字"
+                else:
+                    content_info = "未点开"
                 print(f"    采集到：{title}... ({content_info})")
 
                 if len(collected) >= max_count:
@@ -1232,6 +1298,30 @@ def main():
                 "未找到可用浏览器。请安装 Google Chrome 或 Microsoft Edge，"
                 "或执行 'playwright install chromium' 安装 Playwright 自带浏览器后重试。"
             )
+
+        # 资源拦截：禁用图片/视频/字体（加速+减少请求特征），屏蔽统计/反爬域名
+        def _resource_route(route):
+            try:
+                req = route.request
+                rtype = req.resource_type
+                url = req.url
+                if rtype in ("image", "media", "font"):
+                    route.abort()
+                    return
+                _blocked = ("hm.baidu.com", "sensorsdata.cn", "sensorsdata.com",
+                            "log.snssdk.com", "xlog.snssdk.com", "applog.snssdk.com",
+                            "byteoversea.com", "beacon.qq.com", "google-analytics.com",
+                            "googletagmanager.com", "doubleclick.net", "scorecardresearch.com")
+                if any(d in url for d in _blocked):
+                    route.abort()
+                    return
+                route.continue_()
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+        context.route("**/*", _resource_route)
 
         page = context.new_page()
 
