@@ -6,27 +6,18 @@ echo   小红书关键词采集工具（双击运行）
 echo ============================================================
 echo.
 
-REM ===== 密码验证 =====
-set "CORRECT_PWD=0762"
-set "INPUT_PWD="
-for /f "delims=" %%i in ('powershell -NoProfile -Command "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('请输入访问密码','身份验证','')"') do set "INPUT_PWD=%%i"
-
-if not defined INPUT_PWD (
-    echo [!] 未输入密码或已点取消，程序退出。
-    pause
-    exit /b 1
-)
-
-if "%INPUT_PWD%"=="%CORRECT_PWD%" (
-    echo [√] 密码验证通过，开始运行...
-    echo.
-) else (
-    echo [!] 密码错误，程序退出。
-    pause
-    exit /b 1
-)
-
+REM ===== 双密码验证（访问密码 + 本地pwd.key二级密钥）=====
 set "PY=C:\Users\Admin\AppData\Local\Programs\Python\Python311\python.exe"
+if not exist "%PY%" goto nopy
+"%PY%" auth_check.py
+if errorlevel 1 (
+    echo [!] 密码验证失败或已取消，程序退出。
+    pause
+    exit /b 1
+)
+echo [√] 双密码验证通过，开始运行...
+echo.
+
 if not exist "%PY%" goto nopy
 "%PY%" xhs_keyword_scraper.py
 goto done

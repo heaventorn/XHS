@@ -28,3 +28,6 @@ pip install playwright openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
 - 如遇验证码，手动完成后脚本会继续
 - 建议不要频繁运行，避免触发风控
 - 脚本使用系统已安装的 Chrome 或 Edge，无需额外下载浏览器
+【启动密码验证依赖（Argon2）】
+pip install argon2-cffi -i https://pypi.tuna.tsinghua.edu.cn/simple
+（启动时需输入访问密码 + 本地 pwd.key 中的强密码，两者正确才能运行）
