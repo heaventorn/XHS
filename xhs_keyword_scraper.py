@@ -33,15 +33,57 @@ KEYWORDS = [
     "FA业务",
 ]
 
-MAX_PER_KEYWORD = 30
+MAX_PER_KEYWORD = 10
 FILTER_WITHIN_TWO_YEARS = True
 OUTPUT_FILE = os.path.join(os.path.expanduser("~"), "Desktop", f"小红书关键词采集_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-MAX_SCROLLS = 15
+MAX_SCROLLS = 4
 
 # 账号黑名单：这些账号发布的帖子会被跳过，不采集（精确匹配，不区分大小写）
 BLACKLIST_AUTHORS = [
     # "账号昵称1",
     # "账号昵称2",
+]
+
+# 账号小红书号黑名单：这些小红书号（纯数字ID）发布的帖子会被跳过，不采集
+# 与 BLACKLIST_AUTHORS（昵称）二选一或同时使用均可
+BLACKLIST_IDS = [
+    "109181692",
+    "49292951005",
+]
+
+# 内容不相关关键词黑名单：标题包含这些词的帖子会被跳过（不区分大小写）
+# 用于剔除搜索结果中与 FA/融资/一级市场无关的内容，可根据实际情况增删
+IRRELEVANT_KEYWORDS = [
+    # 养生健康类
+    "养生", "保健", "中医", "中药", "艾灸", "拔罐", "刮痧", "推拿", "按摩", "针灸",
+    "减肥", "瘦身", "健身", "瑜伽", "冥想",
+    # 相亲情感类
+    "相亲", "恋爱", "情感", "婚姻", "择偶", "脱单", "约会", "表白", "分手", "复合",
+    "渣男", "渣女", "绿茶", "海王", "舔狗", "备胎", "暧昧", "暗恋", "初恋", "异地恋",
+    # 美妆时尚类
+    "美妆", "护肤", "化妆", "美甲", "美睫", "美容", "美发", "染发", "烫发", "穿搭",
+    "时尚", "潮流", "奢侈品", "包包", "首饰",
+    # 美食类
+    "美食", "料理", "食谱", "烹饪", "烘焙", "甜品", "蛋糕", "火锅", "烧烤", "奶茶",
+    "咖啡", "茶叶", "红酒", "白酒", "啤酒",
+    # 旅游生活类
+    "旅游", "旅行", "攻略", "景点", "打卡", "拍照", "摄影", "vlog", "日常", "生活",
+    "好物", "推荐", "种草", "测评", "开箱",
+    # 母婴教育类
+    "母婴", "育儿", "亲子", "孕妇", "宝宝", "婴儿", "教育", "学习", "考试", "考研",
+    "考公", "留学", "英语",
+    # 职场副业类
+    "招聘", "求职", "面试", "简历", "职场", "副业", "兼职", "赚钱", "打工", "辞职",
+    "离职", "跳槽",
+    # 房产汽车类
+    "买房", "租房", "装修", "家居", "家具", "家电", "汽车", "车型", "二手车",
+    # 娱乐游戏类
+    "游戏", "电竞", "动漫", "漫画", "小说", "影视", "电影", "电视剧", "音乐", "歌曲",
+    "明星", "八卦", "娱乐", "综艺", "直播", "带货",
+    # 玄学星座类
+    "星座", "塔罗", "命理", "风水", "算命", "占卜", "玄学", "灵异", "鬼故事",
+    # 宠物收藏类
+    "宠物", "猫狗", "花鸟", "收藏", "古董", "文玩",
 ]
 
 
@@ -63,13 +105,13 @@ VIEWPORT = {"width": 1920, "height": 1080}
 LANGUAGES = ["zh-CN", "zh", "en-US", "en"]
 
 # 分层延迟（秒）
-DELAY_PAGE_LOAD = (4.0, 8.0)
-DELAY_AFTER_SEARCH = (3.0, 6.0)
-DELAY_AFTER_SCROLL = (2.0, 4.5)
-DELAY_BETWEEN_KEYWORDS = (8.0, 16.0)
-DELAY_MOUSE_MOVE = (0.4, 1.0)
-DELAY_EXTRACT = (0.3, 0.8)
-DELAY_READ_PAUSE = (1.5, 4.0)  # 阅读停顿
+DELAY_PAGE_LOAD = (10.0, 15.0)
+DELAY_AFTER_SEARCH = (8.0, 12.0)
+DELAY_AFTER_SCROLL = (5.0, 8.0)
+DELAY_BETWEEN_KEYWORDS = (30.0, 60.0)
+DELAY_MOUSE_MOVE = (0.6, 1.4)
+DELAY_EXTRACT = (0.5, 1.2)
+DELAY_READ_PAUSE = (3.0, 6.0)  # 阅读停顿
 
 # ========== 深度 Stealth 注入脚本（v1 优化版） ==========
 STEALTH_SCRIPT_TEMPLATE = r"""
@@ -471,7 +513,6 @@ def move_mouse_human(page, target_x=None, target_y=None, jitter=True):
         # 随机选择一个中途停顿点（15%概率）
         pause_at = random.uniform(0.3, 0.7) if random.random() < 0.15 else None
 
-        prev_x, prev_y = start_x, start_y
         for i in range(steps + 1):
             t = i / steps
             # 三次贝塞尔曲线
@@ -492,8 +533,6 @@ def move_mouse_human(page, target_x=None, target_y=None, jitter=True):
             if pause_at is not None and abs(t - pause_at) < 0.02:
                 time.sleep(random.uniform(0.3, 0.8))
                 pause_at = None
-
-            prev_x, prev_y = x, y
 
         # 末端微抖动（模拟人手到达目标后的不稳定）
         if random.random() < 0.4:
@@ -755,12 +794,28 @@ def clean_author_name(text):
     return lines[0].strip() if lines else text.strip()
 
 
-def is_blacklisted(author_name):
-    """检查作者是否在账号黑名单中（精确匹配，不区分大小写，去除首尾空格）。"""
-    if not author_name or not BLACKLIST_AUTHORS:
+def is_blacklisted(author_name, author_id=""):
+    """检查作者是否在账号黑名单中。
+    支持两种匹配：按昵称（BLACKLIST_AUTHORS）精确匹配，或按小红书号（BLACKLIST_IDS）精确匹配。
+    均不区分大小写、去除首尾空格。"""
+    if author_name:
+        name = author_name.strip().lower()
+        if any(name == b.strip().lower() for b in BLACKLIST_AUTHORS if b.strip()):
+            return True
+    if author_id:
+        aid = author_id.strip()
+        if any(aid == i.strip() for i in BLACKLIST_IDS if i.strip()):
+            return True
+    return False
+
+
+def is_irrelevant_content(title):
+    """检查帖子标题是否包含不相关关键词黑名单（不区分大小写）。
+    命中则返回 True，表示该帖子应被跳过。只检查标题，避免正文误杀。"""
+    if not title or not IRRELEVANT_KEYWORDS:
         return False
-    name = author_name.strip().lower()
-    return any(name == b.strip().lower() for b in BLACKLIST_AUTHORS if b.strip())
+    title_lower = title.strip().lower()
+    return any(kw.strip().lower() in title_lower for kw in IRRELEVANT_KEYWORDS if kw.strip())
 
 
 _PUB_TIME_PATTERNS = [
@@ -922,7 +977,10 @@ def search_keyword(page, keyword):
             page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
     except Exception:
         search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}"
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            print(f"  警告：搜索 URL 直连也失败，关键词「{keyword}」将跳过")
 
     human_sleep(DELAY_AFTER_SEARCH)
 
@@ -949,10 +1007,15 @@ def extract_note_content_with_disguise(context, note_url):
         except Exception:
             return ""
 
-        # 风控检测：页面出现登录/验证/安全字样时立即退出并暂停
+        # 风控检测：页面跳转到安全限制/验证页，或正文出现强风控信号时立即退出并暂停
         try:
+            cur_url = detail_page.url or ""
+            if any(k in cur_url for k in ("website-login", "error_code", "verify")):
+                human_sleep((8.0, 15.0))
+                return ""
             page_text = detail_page.inner_text("body")[:500]
-            if any(kw in page_text for kw in ["登录", "验证", "安全验证", "操作频繁", "异常行为"]):
+            if any(kw in page_text for kw in ["访问频繁", "操作频繁", "安全验证", "请完成验证",
+                                               "滑动验证", "行为异常", "暂时无法", "触发风控"]):
                 human_sleep((8.0, 15.0))
                 return ""
         except Exception:
@@ -1092,8 +1155,8 @@ def scroll_and_collect(page, context, keyword, max_count):
                         if _m:
                             author_id = _m.group(1)
 
-                # 账号黑名单过滤：跳过黑名单账号发布的帖子
-                if is_blacklisted(author_name):
+                # 账号黑名单过滤：跳过黑名单账号（昵称或小红书号命中）发布的帖子
+                if is_blacklisted(author_name, author_id):
                     print(f"    跳过黑名单账号：{author_name}")
                     continue
 
@@ -1105,12 +1168,17 @@ def scroll_and_collect(page, context, keyword, max_count):
                         unknown_kept += 1
                         print(f"    提示：标题「{title[:20]}」发布时间[{publish_time or '未知'}]无法解析，默认保留")
 
+                # 内容不相关筛选：标题包含黑名单关键词的帖子跳过（避免为不相关内容浪费时间）
+                if is_irrelevant_content(title):
+                    print(f"    跳过不相关内容：{title[:40]}...")
+                    continue
+
                 # 先标记已处理（防止详情页打开异常导致重复打开同一个帖子）
                 seen_ids.add(note_id)
 
-                # 随机打开详情页（50%概率，模拟真人不会每条都点进去看）
+                # 随机打开详情页（30%概率，模拟真人不会每条都点进去看）
                 note_content = ""
-                if random.random() < 0.5:
+                if random.random() < 0.3:
                     note_content = extract_note_content_with_disguise(context, full_url)
                     # 点开看完后随机停顿（模拟回味/思考）
                     human_sleep((1.5, 4.0))
@@ -1299,13 +1367,13 @@ def main():
                 "或执行 'playwright install chromium' 安装 Playwright 自带浏览器后重试。"
             )
 
-        # 资源拦截：禁用图片/视频/字体（加速+减少请求特征），屏蔽统计/反爬域名
+        # 资源拦截：禁用视频/字体（保留图片，方便观察筛选出的帖子卡片），屏蔽统计/反爬域名
         def _resource_route(route):
             try:
                 req = route.request
                 rtype = req.resource_type
                 url = req.url
-                if rtype in ("image", "media", "font"):
+                if rtype in ("media", "font"):
                     route.abort()
                     return
                 _blocked = ("hm.baidu.com", "sensorsdata.cn", "sensorsdata.com",
