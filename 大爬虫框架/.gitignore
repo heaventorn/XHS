@@ -1,0 +1,24 @@
+# 浏览器登录态（含 cookie，不上传公开仓库）
+profile/
+.xhs_scraper_profile/
+*_profile/
+
+# 日志
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 输出文件（采集结果 Excel）
+*.xlsx
+
+# 临时脚本（仅根目录，避免误伤 __init__.py）
+/_*.py
+
+# 本地密钥文件（含二级密码强密码，绝不上传公开仓库）
+pwd.key
+*.key
+
+# 环境变量/密钥
+.env
