@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-小红书关键词帖子采集脚本（反检测加固版 v1.1）
+小红书关键词帖子采集脚本（反检测加固版 v1.1 · 实时落盘+反爬强化 v2.0.5）
 功能：搜索指定关键词，采集帖子的账号名、帖子标题、帖子链接，输出到 Excel
+      采到一条立即写入「实时结果文件」，中途退出/崩溃也不丢已采集数据
+反爬强化：偏态人类延迟、真实硬件值注入、关键词乱序+采集量浮动、代理/总量配置
+          plugins/mimeTypes 运行时透传真实值、permissions.toString 伪装 native code
 使用：python xhs_keyword_scraper.py
 依赖：pip install playwright openpyxl
 """
@@ -12,6 +15,7 @@ import sys
 import time
 import random
 import math
+import json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, quote
 from playwright.sync_api import sync_playwright
@@ -36,7 +40,16 @@ KEYWORDS = [
 MAX_PER_KEYWORD = 10
 FILTER_WITHIN_TWO_YEARS = True
 OUTPUT_FILE = os.path.join(os.path.expanduser("~"), "Desktop", f"小红书关键词采集_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+# 实时结果文件（固定名）：每采到 1 条就增量写入，中途退出/崩溃也能保住已采集数据
+LIVE_OUTPUT_FILE = os.path.join(os.path.expanduser("~"), "Desktop", "小红书关键词采集_实时.xlsx")
 MAX_SCROLLS = 4
+
+# 代理设置：留空 = 直连本机 IP；填入后走代理（如 socks5://127.0.0.1:7890 或 http://127.0.0.1:7890）
+# 提示：单 IP 高频是触发风控的首要原因，条件允许建议使用固定住宅代理
+PROXY_URL = ""
+
+# 单次运行总采集上限：防止单 IP 一次性抓太多触发频控（达到后提前结束）
+MAX_TOTAL_NOTES = 60
 
 # 账号黑名单：这些账号发布的帖子会被跳过，不采集（精确匹配，不区分大小写）
 BLACKLIST_AUTHORS = [
@@ -90,6 +103,10 @@ IRRELEVANT_KEYWORDS = [
 # 持久化浏览器用户目录：用于保存登录态，避免每次运行重新扫码
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".xhs_scraper_profile")
 
+# 全量累积结果（跨关键词），用于实时落盘与中断时保存
+_all_rows = []
+_seen_note_ids = set()
+
 # 卡片内常见发布时间元素（启发式；定位不到时回退到正则从卡片文本提取）
 TIME_SELECTORS = [
     "span[class*='date']",
@@ -129,7 +146,7 @@ function __seededRandom(seed) {
 }
 
 // ===== 1. 核心自动化特征掩盖（含原型链）=====
-const __wdDesc = { get: () => undefined, set: () => {}, configurable: true, enumerable: true };
+const __wdDesc = { get: () => false, set: () => {}, configurable: true, enumerable: true };
 Object.defineProperty(navigator, 'webdriver', __wdDesc);
 try { Object.defineProperty(Navigator.prototype, 'webdriver', __wdDesc); } catch(e) {}
 Object.defineProperty(navigator, 'automation', { get: () => undefined, configurable: true });
@@ -145,21 +162,14 @@ if (navigator.__proto__) {
     .forEach(function(p){ try{ delete __np[p]; }catch(e){} });
 }
 
-// ===== 2. Navigator 完整属性伪造 =====
-const __plugins = [
-    {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format'},
-    {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''},
-    {name:'Native Client', filename:'internal-nacl-plugin', description:''}
-];
+// ===== 2. Navigator 完整属性伪造（plugins/mimeTypes 运行时透传真实值，避免数量/内容与真机不符）=====
+const __plugins = __PLUGINS_JSON__;
 __plugins.item = function(i){ return __plugins[i] || null; };
 __plugins.namedItem = function(n){ return __plugins.find(function(p){return p.name===n;}) || null; };
 __plugins.refresh = function(){};
 Object.defineProperty(navigator, 'plugins', { get: function(){ return __plugins; }, configurable: true });
 
-const __mimes = [
-    {type:'application/pdf', suffixes:'pdf', description:''},
-    {type:'application/x-google-chrome-pdf', suffixes:'pdf', description:''}
-];
+const __mimes = __MIMES_JSON__;
 __mimes.item = function(i){ return __mimes[i] || null; };
 __mimes.namedItem = function(n){ return __mimes.find(function(m){return m.type===n;}) || null; };
 Object.defineProperty(navigator, 'mimeTypes', { get: function(){ return __mimes; }, configurable: true });
@@ -167,11 +177,11 @@ Object.defineProperty(navigator, 'mimeTypes', { get: function(){ return __mimes;
 const __navProps = {
     languages: ['zh-CN','zh','en-US','en'],
     language: 'zh-CN',
-    hardwareConcurrency: 16,
-    deviceMemory: 16,
-    maxTouchPoints: 0,
-    vendor: 'Google Inc.',
-    platform: 'Win32',
+    hardwareConcurrency: __HW_CONCURRENCY__,
+    deviceMemory: __DEVICE_MEMORY__,
+    maxTouchPoints: __MAX_TOUCH_POINTS__,
+    vendor: '__VENDOR__',
+    platform: '__PLATFORM__',
     cookieEnabled: true,
     onLine: true,
     doNotTrack: null,
@@ -250,7 +260,7 @@ window.chrome.loadTimes = window.chrome.loadTimes || function(){ return {
 // ===== 5. Permissions 完整伪造 =====
 if (navigator.permissions && navigator.permissions.query) {
     const __origQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = function(parameters) {
+    const __query = function(parameters) {
         var name = parameters.name;
         if (name === 'notifications') return Promise.resolve({ state: Notification.permission, onchange:null });
         if (name === 'geolocation') return Promise.resolve({ state:'prompt', onchange:null });
@@ -258,6 +268,10 @@ if (navigator.permissions && navigator.permissions.query) {
         if (name === 'midi') return Promise.resolve({ state:'prompt', onchange:null });
         return __origQuery(parameters);
     };
+    // 保留原生函数名与 toString 特征，避免 toString() 暴露自定义函数体
+    try { Object.defineProperty(__query, 'name', { value: 'query', configurable: true }); } catch(e){}
+    try { window.__spoofedFns = window.__spoofedFns || []; window.__spoofedFns.push(__query); } catch(e){}
+    navigator.permissions.query = __query;
 }
 try { Object.defineProperty(Notification, 'permission', { get: function(){ return 'default'; }, configurable: true }); } catch(e){}
 
@@ -303,16 +317,16 @@ CanvasRenderingContext2D.prototype.getImageData = function() {
 try {
     var __glGetParam = WebGLRenderingContext.prototype.getParameter;
     WebGLRenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return "Google Inc. (NVIDIA)";
-        if (param === 37446) return "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+        if (param === 37445) return "__WEBGL_VENDOR__";
+        if (param === 37446) return "__WEBGL_RENDERER__";
         return __glGetParam.call(this, param);
     };
 } catch(e){}
 try {
     var __gl2GetParam = WebGL2RenderingContext.prototype.getParameter;
     WebGL2RenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return "Google Inc. (NVIDIA)";
-        if (param === 37446) return "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+        if (param === 37445) return "__WEBGL_VENDOR__";
+        if (param === 37446) return "__WEBGL_RENDERER__";
         return __gl2GetParam.call(this, param);
     };
 } catch(e){}
@@ -349,6 +363,8 @@ if (window.AudioContext || window.webkitAudioContext) {
 const __origToString = Function.prototype.toString;
 Function.prototype.toString = function() {
     try {
+        // 对被脚本覆盖的函数，返回 native code 伪装，防止 toString() 暴露自定义函数体
+        try { if (window.__spoofedFns && window.__spoofedFns.indexOf(this) !== -1) return 'function query() { [native code] }'; } catch(e){}
         var result = __origToString.call(this);
         if (result.indexOf('[native code]') !== -1) return result;
         return result;
@@ -470,13 +486,34 @@ try {
 """
 
 
-def build_stealth_script(real_ua):
-    """用真实 User-Agent 替换注入模板中的占位符，生成与运行环境一致的注入脚本。
+def build_stealth_script(real_ua, nav=None):
+    """用真实 User-Agent 与真实硬件/平台值替换注入模板占位符，生成与运行环境一致的注入脚本。
 
-    修复原硬编码 UA 与真实浏览器版本不一致、反而暴露自动化特征的问题；
+    修复原硬编码 UA/硬件值与真实浏览器版本不一致、反而暴露自动化特征的问题；
     同时从 UA 解析出 Chrome 版本号，用于 userAgentData（UA Client Hints）伪造，
     保证 navigator.userAgent 与 navigator.userAgentData.brands 的版本完全一致。
+    nav 为运行时读取的真实导航属性 dict，未提供时使用安全兜底值。
     """
+    nav = nav or {}
+    hw = int(nav.get("hw") or 8)
+    mem = float(nav.get("mem") or 8)
+    mtp = int(nav.get("mtp") or 0)
+    platform = str(nav.get("platform") or "Win32")
+    vendor = str(nav.get("vendor") or "Google Inc.")
+    webgl_vendor = str(nav.get("webgl_vendor") or "Google Inc.")
+    webgl_renderer = str(nav.get("webgl_renderer") or "ANGLE")
+    # 运行时透传真实 plugins / mimeTypes（读取失败时回退到保守的常见值）
+    plugins_json = json.dumps(nav.get("plugins") or [
+        {"name": "PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai", "description": ""},
+        {"name": "Chrome PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai", "description": ""},
+        {"name": "Chromium PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai", "description": ""},
+        {"name": "Microsoft Edge PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai", "description": ""},
+        {"name": "WebKit built-in PDF", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+    ], ensure_ascii=False)
+    mimes_json = json.dumps(nav.get("mimes") or [
+        {"type": "application/pdf", "suffixes": "pdf", "description": ""},
+        {"type": "text/pdf", "suffixes": "pdf", "description": ""},
+    ], ensure_ascii=False)
     m = re.search(r"Chrome/(\d+)(?:\.(\d+)\.(\d+)\.(\d+))?", real_ua)
     if m:
         major = m.group(1)
@@ -486,12 +523,31 @@ def build_stealth_script(real_ua):
     return (STEALTH_SCRIPT_TEMPLATE
             .replace("__UA_PLACEHOLDER__", real_ua)
             .replace("__CHROME_MAJOR_PLACEHOLDER__", major)
-            .replace("__CHROME_VERSION_PLACEHOLDER__", full_ver))
+            .replace("__CHROME_VERSION_PLACEHOLDER__", full_ver)
+            .replace("__HW_CONCURRENCY__", str(hw))
+            .replace("__DEVICE_MEMORY__", str(mem))
+            .replace("__MAX_TOUCH_POINTS__", str(mtp))
+            .replace("__PLATFORM__", platform)
+            .replace("__VENDOR__", vendor)
+            .replace("__WEBGL_VENDOR__", webgl_vendor)
+            .replace("__WEBGL_RENDERER__", webgl_renderer)
+            .replace("__PLUGINS_JSON__", plugins_json)
+            .replace("__MIMES_JSON__", mimes_json))
 # =================================================
 
 
+def _skewed_random(lo, hi):
+    """人类长尾偏态随机：多数时候接近下限，偶尔出现长停顿。
+    真实人类操作间隔近似长尾/幂律分布，均匀分布反而像机器。"""
+    if hi <= lo:
+        return lo
+    # random()**k 偏向小值，k 越大越偏下限；k 本身带随机，避免模式固定
+    p = random.random() ** random.uniform(1.8, 3.2)
+    return lo + (hi - lo) * p
+
+
 def human_sleep(delay_range):
-    time.sleep(random.uniform(*delay_range))
+    time.sleep(_skewed_random(*delay_range))
 
 
 def move_mouse_human(page, target_x=None, target_y=None, jitter=True):
@@ -1196,6 +1252,9 @@ def scroll_and_collect(page, context, keyword, max_count):
                     "发布时间": publish_time,
                 })
 
+                # 实时落盘：采到一条立即写入实时文件，防止中途退出丢失已采集数据
+                _live_save(collected)
+
                 if note_content:
                     content_info = f"已点开·正文{len(note_content)}字"
                 else:
@@ -1292,18 +1351,70 @@ def save_to_excel(data, filepath):
     return filepath
 
 
+def _live_save(rows):
+    """实时落盘：把当前已有结果写入实时文件（固定名），失败不阻断主流程。"""
+    try:
+        save_to_excel(rows, LIVE_OUTPUT_FILE)
+    except Exception:
+        pass
+
+
+def _run_keywords(page, context):
+    # 关键词顺序每次运行随机打乱：打散跨会话行为画像，避免固定扫描模式
+    kws = list(KEYWORDS)
+    random.shuffle(kws)
+    for idx, kw in enumerate(kws):
+        print(f"【{kw}】正在搜索...")
+        try:
+            # 每词采集量加随机浮动（下限1条，上限 MAX_PER_KEYWORD），避免每次都是固定10条
+            cap = max(1, int(MAX_PER_KEYWORD * random.uniform(0.5, 1.0)))
+            results = scroll_and_collect(page, context, kw, cap)
+
+            new_count = 0
+            for item in results:
+                nid = extract_note_id(item["帖子链接"])
+                if nid not in _seen_note_ids:
+                    _seen_note_ids.add(nid)
+                    _all_rows.append(item)
+                    new_count += 1
+
+            print(f"【{kw}】采集完成，本关键词 {len(results)} 条（目标{cap}），去重后新增 {new_count} 条\n")
+        except Exception as e:
+            print(f"【{kw}】采集出错：{e}\n")
+            continue
+
+        # 单次总量上限：达到后提前结束，防止单 IP 一次抓太多
+        if MAX_TOTAL_NOTES and len(_all_rows) >= MAX_TOTAL_NOTES:
+            print(f"\n已达单次总量上限 {MAX_TOTAL_NOTES} 条，提前结束采集。")
+            break
+
+        if idx < len(kws) - 1:
+            print(f"  等待 {int(DELAY_BETWEEN_KEYWORDS[0])}-{int(DELAY_BETWEEN_KEYWORDS[1])} 秒后继续...")
+            # 等待期间模拟人类浏览
+            wait_end = time.time() + _skewed_random(*DELAY_BETWEEN_KEYWORDS)
+            while time.time() < wait_end:
+                if random.random() < 0.6:
+                    move_mouse_human(page)
+                if random.random() < 0.3:
+                    random_hover(page)
+                if random.random() < 0.2:
+                    human_scroll(page, random.choice(["down", "up"]))
+                if random.random() < 0.1:
+                    random_click_blank(page)
+                human_sleep((1.5, 3.0))
+
+
 def main():
     print("=" * 60)
     print("小红书关键词帖子采集工具（反检测加固版 v1）")
     print("=" * 60)
-    print(f"关键词列表：{KEYWORDS}")
-    print(f"每个关键词最多采集：{MAX_PER_KEYWORD} 条")
+    print(f"关键词列表：{KEYWORDS}（顺序每次随机打乱）")
+    print(f"每个关键词最多采集：{MAX_PER_KEYWORD} 条（实际随机浮动）")
+    print(f"单次总采集上限：{MAX_TOTAL_NOTES} 条")
+    print(f"代理：{PROXY_URL or '直连（本机 IP）'}")
     print(f"两年内过滤：{'开启' if FILTER_WITHIN_TWO_YEARS else '关闭'}")
     print(f"输出文件：{OUTPUT_FILE}")
     print("=" * 60)
-
-    all_results = []
-    seen_note_ids = set()
 
     with sync_playwright() as p:
         launch_args = [
@@ -1336,6 +1447,7 @@ def main():
                     geolocation={"latitude": 29.5630, "longitude": 106.5516},
                     color_scheme="light",
                     ignore_default_args=["--enable-automation"],
+                    **({"proxy": {"server": PROXY_URL}} if PROXY_URL else {}),
                 )
                 used_channel = channel
                 print(f"使用浏览器：{channel}")
@@ -1357,6 +1469,7 @@ def main():
                     geolocation={"latitude": 29.5630, "longitude": 106.5516},
                     color_scheme="light",
                     ignore_default_args=["--enable-automation"],
+                    **({"proxy": {"server": PROXY_URL}} if PROXY_URL else {}),
                 )
                 used_channel = "playwright-chromium"
             except Exception:
@@ -1393,10 +1506,62 @@ def main():
 
         page = context.new_page()
 
-        # 读取真实 User-Agent，动态生成注入脚本（修复硬编码 UA 与真实版本不一致的自相矛盾）
+        # 读取真实 User-Agent 与硬件/平台属性，动态生成注入脚本
+        # 修复硬编码硬件值(如固定16核/16G/RTX3060)与真机不一致反而暴露自动化特征的问题
+        _NAV_JS = (
+            "() => {"
+            "  const c = document.createElement('canvas');"
+            "  const gl = c.getContext('webgl') || c.getContext('experimental-webgl');"
+            "  let v = '', r = '';"
+            "  try {"
+            "    if (gl) {"
+            "      const dbg = gl.getExtension('WEBGL_debug_renderer_info');"
+            "      if (dbg) {"
+            "        v = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '';"
+            "        r = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '';"
+            "      }"
+            "    }"
+            "  } catch(e){}"
+            "  const pl = [];"
+            "  try { for (let i = 0; i < navigator.plugins.length; i++) {"
+            "    const p = navigator.plugins[i];"
+            "    pl.push({name: p.name, filename: p.filename, description: p.description});"
+            "  } } catch(e){}"
+            "  const mm = [];"
+            "  try { for (let j = 0; j < navigator.mimeTypes.length; j++) {"
+            "    const m = navigator.mimeTypes[j];"
+            "    mm.push({type: m.type, suffixes: m.suffixes, description: m.description});"
+            "  } } catch(e){}"
+            "  return {"
+            "    hw: navigator.hardwareConcurrency || 8,"
+            "    mem: navigator.deviceMemory || 8,"
+            "    mtp: navigator.maxTouchPoints || 0,"
+            "    platform: navigator.platform || 'Win32',"
+            "    vendor: navigator.vendor || 'Google Inc.',"
+            "    webgl_vendor: v,"
+            "    webgl_renderer: r,"
+            "    plugins: pl,"
+            "    mimes: mm"
+            "  };"
+            "}"
+        )
         page.goto("about:blank")
         real_ua = page.evaluate("navigator.userAgent") or USER_AGENT
-        context.add_init_script(build_stealth_script(real_ua))
+        try:
+            real_nav = page.evaluate(_NAV_JS)
+        except Exception:
+            real_nav = {}
+        context.add_init_script(build_stealth_script(real_ua, real_nav))
+
+        # UA-CH 预热：主动请求一次 high-entropy 值，促使浏览器在后续请求自然携带完整 Sec-CH-UA-* 头
+        try:
+            page.evaluate(
+                "navigator.userAgentData && navigator.userAgentData.getHighEntropyValues ? "
+                "navigator.userAgentData.getHighEntropyValues("
+                "['architecture','bitness','platformVersion','fullVersionList']).catch(function(){}) : Promise.resolve()"
+            )
+        except Exception:
+            pass
 
         # 请求头交给真实浏览器原生发送，不再强制覆盖（避免 UA / Client-Hints 与真实版本冲突）
 
@@ -1435,45 +1600,32 @@ def main():
 
         print("登录状态确认，开始采集...\n")
 
-        for idx, kw in enumerate(KEYWORDS):
-            print(f"【{kw}】正在搜索...")
-            try:
-                search_keyword(page, kw)
-                results = scroll_and_collect(page, context, kw, MAX_PER_KEYWORD)
-
-                new_count = 0
-                for item in results:
-                    nid = extract_note_id(item["帖子链接"])
-                    if nid not in seen_note_ids:
-                        seen_note_ids.add(nid)
-                        all_results.append(item)
-                        new_count += 1
-
-                print(f"【{kw}】采集完成，本关键词 {len(results)} 条，去重后新增 {new_count} 条\n")
-            except Exception as e:
-                print(f"【{kw}】采集出错：{e}\n")
-                continue
-
-            if idx < len(KEYWORDS) - 1:
-                print(f"  等待 {int(DELAY_BETWEEN_KEYWORDS[0])}-{int(DELAY_BETWEEN_KEYWORDS[1])} 秒后继续...")
-                # 等待期间模拟人类浏览
-                wait_end = time.time() + random.uniform(*DELAY_BETWEEN_KEYWORDS)
-                while time.time() < wait_end:
-                    if random.random() < 0.6:
-                        move_mouse_human(page)
-                    if random.random() < 0.3:
-                        random_hover(page)
-                    if random.random() < 0.2:
-                        human_scroll(page, random.choice(["down", "up"]))
-                    if random.random() < 0.1:
-                        random_click_blank(page)
-                    human_sleep((1.5, 3.0))
+        try:
+            _run_keywords(page, context)
+        except KeyboardInterrupt:
+            print("\n\n收到中断信号（Ctrl+C），正在保存已采集的数据...")
+            context.close()
+            if _all_rows:
+                save_to_excel(_all_rows, OUTPUT_FILE)
+                print(f"已保存 {len(_all_rows)} 条到：{OUTPUT_FILE}")
+            else:
+                print("本次尚未采集到任何数据。")
+            return
+        except Exception as e:
+            print(f"\n\n采集过程发生异常：{e}")
+            context.close()
+            if _all_rows:
+                save_to_excel(_all_rows, OUTPUT_FILE)
+                print(f"已保存 {len(_all_rows)} 条到：{OUTPUT_FILE}")
+            else:
+                print("本次尚未采集到任何数据。")
+            return
 
         context.close()
 
-    if all_results:
-        save_path = save_to_excel(all_results, OUTPUT_FILE)
-        print(f"\n全部完成！共采集 {len(all_results)} 条不重复帖子")
+    if _all_rows:
+        save_path = save_to_excel(_all_rows, OUTPUT_FILE)
+        print(f"\n全部完成！共采集 {len(_all_rows)} 条不重复帖子")
         print(f"Excel 已保存至：{save_path}")
     else:
         print("\n未采集到任何数据，请检查网络和登录状态。")
