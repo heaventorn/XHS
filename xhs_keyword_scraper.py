@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-小红书关键词帖子采集脚本（反检测加固版 v1.1 · 实时落盘+反爬强化 v2.0.5）
+小红书关键词帖子采集脚本（反检测加固版 v2.0.6）
 功能：搜索指定关键词，采集帖子的账号名、帖子标题、帖子链接，输出到 Excel
       采到一条立即写入「实时结果文件」，中途退出/崩溃也不丢已采集数据
 反爬强化：偏态人类延迟、真实硬件值注入、关键词乱序+采集量浮动、代理/总量配置
           plugins/mimeTypes 运行时透传真实值、permissions.toString 伪装 native code
+v2.0.6：详情页/搜索兜底跳转注入 Referer（模拟点击链）、拦截 favicon 消除双峰时序
 使用：python xhs_keyword_scraper.py
 依赖：pip install playwright openpyxl
 """
@@ -1003,6 +1004,35 @@ def is_logged_in(page):
         return False
 
 
+def goto_with_referer(page, url, timeout=30000):
+    """带 Referer 的页面跳转：模拟从当前页"点击"进入目标页，避免 Referer 为空被识别为程序化跳转。
+
+    真实用户从 A 页点击链接进 B 页时，B 页请求必带 Referer=A。
+    直接 page.goto() 会让 Referer 为空，服务器会将其判定为脚本直连。
+    经实测，route.continue_ 无法覆盖 Referer（Chromium 忽略），必须用 set_extra_http_headers 才能发出。
+    """
+    referer_url = ""
+    try:
+        cur = page.url or ""
+        if cur and "about:blank" not in cur:
+            referer_url = cur
+    except Exception:
+        pass
+    if referer_url:
+        try:
+            page.set_extra_http_headers({"Referer": referer_url})
+        except Exception:
+            pass
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    finally:
+        # 用完即清，避免影响后续页面的 Referer 语义
+        try:
+            page.set_extra_http_headers({})
+        except Exception:
+            pass
+
+
 def search_keyword(page, keyword):
     """通过首页搜索框搜索，模拟人类操作"""
     try:
@@ -1030,11 +1060,11 @@ def search_keyword(page, keyword):
             search_input.press("Enter")
         else:
             search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}"
-            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            goto_with_referer(page, search_url)
     except Exception:
         search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}"
         try:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            goto_with_referer(page, search_url)
         except Exception:
             print(f"  警告：搜索 URL 直连也失败，关键词「{keyword}」将跳过")
 
@@ -1057,7 +1087,29 @@ def extract_note_content_with_disguise(context, note_url):
     失败或触发风控返回空字符串。"""
     detail_page = None
     try:
+        # ===== 修复 Referer 链：模拟从当前搜索结果页"点击"进入详情 =====
+        # 真实用户从搜索列表点击卡片进详情，Referer 必为搜索结果页 URL。
+        # 直接 goto() 会让 Referer 为空，被服务器识别为程序化跳转。
+        # 注意：route.continue_ 覆盖 Referer 无效（Chromium 会忽略），
+        # 必须用 set_extra_http_headers 才能真正发出 Referer 头。
+        referer_url = ""
+        try:
+            for pg in reversed(context.pages):
+                u = (pg.url or "")
+                if u and "about:blank" not in u:
+                    referer_url = u
+                    break
+        except Exception:
+            pass
+
         detail_page = context.new_page()
+
+        if referer_url:
+            try:
+                detail_page.set_extra_http_headers({"Referer": referer_url})
+            except Exception:
+                pass
+
         try:
             detail_page.goto(note_url, wait_until="domcontentloaded", timeout=12000)
         except Exception:
@@ -1486,6 +1538,11 @@ def main():
                 req = route.request
                 rtype = req.resource_type
                 url = req.url
+                # 修复：拦截 favicon.ico —— 真实浏览器 favicon 有缓存，不会每次跳转都重新请求。
+                # 之前每次 goto 后紧跟 0.02s 的 /favicon.ico 请求，形成"页面+favicon 双峰"时序特征。
+                if "favicon" in url.lower() or url.rstrip("/").endswith(".ico"):
+                    route.abort()
+                    return
                 if rtype in ("media", "font"):
                     route.abort()
                     return
