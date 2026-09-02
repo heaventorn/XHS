@@ -113,6 +113,12 @@ NAV_READ_JS = (
 
 def prepare_context(context, page, build_stealth_script, fallback_ua):
     """在已创建的 context/page 上注入 stealth 脚本并预热 UA-CH。
+
+    双保险注入：
+      1. context.add_init_script —— 对**未来新建的页面**在任何脚本执行前注入
+      2. page.evaluate —— 对**当前已有页面**立即注入（修复 launch_persistent_context
+         创建的 pages[0] 没有 init_script 保护、被反爬检测到死循环刷新的问题）
+
     :param build_stealth_script: core.stealth 中的构建函数
     :param fallback_ua: 兜底 UA（各采集器提供）
     """
@@ -122,7 +128,17 @@ def prepare_context(context, page, build_stealth_script, fallback_ua):
         real_nav = page.evaluate(NAV_READ_JS)
     except Exception:
         real_nav = {}
-    context.add_init_script(build_stealth_script(real_ua, real_nav))
+
+    stealth_script = build_stealth_script(real_ua, real_nav)
+
+    # 1. 对未来新建页面生效
+    context.add_init_script(stealth_script)
+
+    # 2. 对当前已有页面立即注入（关键修复：persistent context 的首页没有 init_script 保护）
+    try:
+        page.evaluate(stealth_script)
+    except Exception:
+        pass  # about:blank 页面 evaluate 可能偶发失败，不影响后续导航
 
     # UA-CH 预热：主动请求 high-entropy 值，促使浏览器后续自然携带完整 Sec-CH-UA-* 头
     try:

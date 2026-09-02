@@ -82,11 +82,13 @@ _NOISE_NAMES = (
 
 
 def _is_logged_in(page):
-    """登录检测：访问搜索页，若跳转到 platform/login 则未登录。"""
+    """登录检测：只检查当前页面 URL，不发起导航（避免与登录页 goto 冲突导致死循环刷新）。
+    about:blank / 空 URL / login 登录页均视为未登录。"""
     try:
-        page.goto(SEARCH_URL.format("测试"), wait_until="domcontentloaded", timeout=30000)
-        human_sleep((1.5, 3.0))
-        return "platform/login" not in page.url and "login" not in page.url
+        url = page.url or ""
+        if not url or "about:blank" in url:
+            return False
+        return "platform/login" not in url and "login" not in url
     except Exception:
         return False
 
@@ -114,9 +116,9 @@ class MaimaiCrawler:
 
         with sync_playwright() as p:
             context, used_channel = launch_browser_context(p, PROFILE_DIR, viewport=H.VIEWPORT)
-            network.install_resource_route(context)
+            # 脉脉不注入 stealth、不拦截资源：stealth 会破坏脉脉登录页交互，
+            # 且脉脉反爬检测较宽松，纯净浏览器环境即可正常使用。
             page = context.pages[0] if context.pages else context.new_page()
-            real_ua = network.prepare_context(context, page, S.build_stealth_script, "")
 
             # ---- 登录检测 / 引导（脉脉必须登录） ----
             if not _is_logged_in(page):
@@ -125,7 +127,8 @@ class MaimaiCrawler:
                 print("请在弹出浏览器中完成登录（扫码 / 手机号+验证码均可），")
                 print("脚本会自动检测登录状态，登录成功后自动继续...")
                 print("!" * 50)
-                page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=30000)
+                page.goto(LOGIN_PAGE, wait_until="load", timeout=60000)
+                time.sleep(2)  # 等待扫码二维码/登录按钮渲染完成
                 waited = 0
                 while waited < login_timeout:
                     time.sleep(3)
@@ -213,72 +216,75 @@ class MaimaiCrawler:
                 break
 
     def _extract_persons(self, page, company):
-        """从搜索结果页提取人员名片（姓名/职位/公司/链接）。
-        策略：遍历页面中的链接，匹配人员 profile URL，提取附近文本。"""
+        """从搜索结果页提取人员名片（姓名/职位/公司）。
+        脉脉搜索结果格式：「姓名· 职位描述」在同一行，用 · 分隔。
+        职位描述中可能包含公司名（如「上海方橙企业管理咨询有限公司创始人&CEO」）。"""
         persons = []
-        seen_names = set()
+        seen = set()
         try:
-            full = page.evaluate("() => document.body.innerText") or ""
+            full = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:
             full = ""
 
-        # 策略1：从页面文本中提取「姓名 + 职位 + 公司」模式
-        # 脉脉搜索结果中人员卡片通常格式：姓名 \n 职位 @ 公司 \n 地点
-        lines = [l.strip() for l in full.split("\n") if l.strip()]
-        for i, line in enumerate(lines):
-            # 姓名必须是 2-5 个中文字（含·），且不是噪音词
-            name_match = re.match(r"^[\u4e00-\u9fa5·]{2,5}$", line)
-            if not name_match:
-                continue
-            name = line
-            if name in _NOISE_NAMES:
-                continue
-            if i + 1 >= len(lines):
-                continue
-            position_line = lines[i + 1]
-            # 职位行必须含 @（脉脉标准格式）或职位关键词，否则跳过
-            if "@" not in position_line and not any(kw in position_line for kw in _KEY_POSITIONS):
-                continue
-            position = position_line
-            comp = company
-            if "@" in position_line:
-                parts = position_line.split("@", 1)
-                position = parts[0].strip()
-                comp = parts[1].strip()
-            # 过滤：职位太短/纯数字/噪音
-            if len(position) < 2 or position.isdigit() or position in _NOISE_NAMES:
-                continue
-            if name not in seen_names:
-                seen_names.add(name)
-                persons.append({
-                    "姓名": name,
-                    "职位": position,
-                    "公司": comp,
-                    "链接": "",
-                })
+        if not full:
+            return persons
 
-        # 策略2：从链接中提取人员 profile（补充链接）
-        try:
-            links = page.query_selector_all("a")
-            person_urls = []
-            for a in links:
-                try:
-                    href = a.get_attribute("href") or ""
-                    if ("/web/user/" in href or "/ent/user/" in href or
-                        "/user/" in href and "maimai" in href):
-                        name = (a.text_content() or "").strip()
-                        if name and 2 <= len(name) <= 10:
-                            person_urls.append({"name": name, "href": href})
-                except Exception:
-                    continue
-            # 把链接补充到已提取的人员
-            for pu in person_urls:
-                for p in persons:
-                    if p["姓名"] == pu["name"] and not p["链接"]:
-                        p["链接"] = pu["href"] if pu["href"].startswith("http") else "https://maimai.cn" + pu["href"]
-                        break
-        except Exception:
-            pass
+        lines = [l.strip() for l in full.split("\n") if l.strip()]
+        # 匹配「姓名· 职位」格式：· 前面是姓名（2-15字符），后面是职位
+        person_line_re = re.compile(r"^(.{2,15}?)·\s*(.+)$")
+        # 公司关键词，用于从职位中分离公司名
+        company_keywords = ("有限公司", "股份公司", "合伙企业", "集团", "投资", "资本",
+                            "基金", "咨询", "科技", "生物", "医疗", "医药", "电子",
+                            "信息", "网络", "数据", "智能", "能源", "材料", "制造")
+
+        for line in lines:
+            m = person_line_re.match(line)
+            if not m:
+                continue
+            name = m.group(1).strip()
+            position_full = m.group(2).strip()
+
+            # 过滤噪音：姓名是纯数字/太短/是导航词
+            if len(name) < 2 or name.isdigit() or name in _NOISE_NAMES:
+                continue
+            # 过滤排序选项等（姓名中包含"排序"等词）
+            if any(kw in name for kw in ("排序", "搜索", "筛选", "全部", "加载", "没有", "相关")):
+                continue
+            # 过滤职位太短/纯数字
+            if len(position_full) < 2 or position_full.isdigit():
+                continue
+
+            # 从职位中分离公司名和职位
+            comp = ""
+            position = position_full
+            for kw in company_keywords:
+                idx = position_full.find(kw)
+                if idx > 0:
+                    # 公司名 = 关键词前面的部分（到上一个空格/标点）
+                    comp_part = position_full[:idx + len(kw)]
+                    # 取最后一个空格后的部分作为公司名
+                    parts = comp_part.rsplit(" ", 1)
+                    if len(parts) == 2 and len(parts[1]) >= 4:
+                        comp = parts[1]
+                        position = position_full[len(parts[0]) + 1:].strip()
+                    else:
+                        comp = comp_part
+                        position = position_full[len(comp_part):].strip()
+                    break
+
+            # 去重（姓名+职位）
+            key = f"{name}|{position_full}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            persons.append({
+                "姓名": name,
+                "职位": position or position_full,
+                "公司": comp or company,
+                "地点": "",
+                "链接": "",
+            })
 
         return persons
 

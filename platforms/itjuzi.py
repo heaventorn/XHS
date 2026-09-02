@@ -76,17 +76,28 @@ _PHONE_RE = re.compile(r"(?:\+?86[-\s]?)?(?:1[3-9]\d{9}|0\d{2,3}[-\s]?\d{7,8})")
 
 
 def _is_logged_in(page):
-    """登录检测：访问搜索页，若跳转到 login 或结果全为 0 则未登录。"""
+    """登录检测：检查 URL 和页面内容中的多个已登录标志。
+    about:blank / 空 URL / login 页视为未登录；
+    URL 不含 login 且页面有 退出/开通VIP/嗨~ 等标志，或无登录注册提示，视为已登录。"""
     try:
-        page.goto(SEARCH_URL.format("测试"), wait_until="domcontentloaded", timeout=30000)
-        human_sleep((1.5, 3.0))
-        if "login" in page.url:
+        url = page.url or ""
+        if not url or "about:blank" in url:
             return False
-        txt = page.evaluate("() => document.body.innerText") or ""
-        # 未登录时所有分类计数为 0 且显示"抱歉，没有相关的结果"
-        if "抱歉，没有相关的结果" in txt and "登录" in txt:
+        if "login" in url:
             return False
-        return True
+        # URL 已不含 login，进一步检查页面内容
+        try:
+            txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            # 明确的已登录标志
+            if "退出" in txt or "开通VIP" in txt or "嗨~" in txt:
+                return True
+            # 没有登录/注册提示，也视为已登录
+            if "登录" not in txt and "注册" not in txt:
+                return True
+            return False
+        except Exception:
+            # page.evaluate 失败（页面还在跳转/渲染），只靠 URL 判断
+            return True
     except Exception:
         return False
 
@@ -114,9 +125,9 @@ class ItjuziCrawler:
 
         with sync_playwright() as p:
             context, used_channel = launch_browser_context(p, PROFILE_DIR, viewport=H.VIEWPORT)
-            network.install_resource_route(context)
+            # IT桔子不注入 stealth、不拦截资源：stealth 会破坏登录页交互，
+            # 且纯净浏览器环境即可正常使用（与脉脉一致）。
             page = context.pages[0] if context.pages else context.new_page()
-            real_ua = network.prepare_context(context, page, S.build_stealth_script, "")
 
             # ---- 登录检测 / 引导（IT桔子必须登录） ----
             if not _is_logged_in(page):
@@ -125,7 +136,23 @@ class ItjuziCrawler:
                 print("请在弹出浏览器中完成登录（密码/短信/扫码均可），")
                 print("脚本会自动检测登录状态，登录成功后自动继续...")
                 print("!" * 50)
-                page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=30000)
+                # 登录页加载重试：5平台并行时系统资源紧张可能导致超时，重试3次
+                login_loaded = False
+                for attempt in range(3):
+                    try:
+                        page.goto(LOGIN_PAGE, wait_until="load", timeout=90000)
+                        login_loaded = True
+                        break
+                    except Exception as e:
+                        print(f"\n登录页加载失败（第{attempt+1}/3次）: {e}")
+                        if attempt < 2:
+                            print("5秒后重试...")
+                            time.sleep(5)
+                if not login_loaded:
+                    print("\n登录页加载失败3次，IT桔子采集器退出。")
+                    context.close()
+                    return []
+                time.sleep(2)  # 等待登录按钮/扫码框渲染完成
                 waited = 0
                 while waited < login_timeout:
                     time.sleep(3)
@@ -163,9 +190,10 @@ class ItjuziCrawler:
         return self.rows
 
     def _crawl_company(self, page, company):
-        # 1. 搜索
+        # 1. 搜索（IT桔子是 SPA，需要等待页面完全渲染）
         url = SEARCH_URL.format(urllib.parse.quote(company))
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.goto(url, wait_until="load", timeout=60000)
+        time.sleep(5)  # 等待 SPA 渲染搜索结果
         human_sleep(H.DELAY_AFTER_SEARCH)
         move_mouse_human(page)
 
@@ -214,7 +242,8 @@ class ItjuziCrawler:
         for a in links:
             try:
                 href = a.get_attribute("href") or ""
-                if "/company/" in href and "itjuzi.com" in href:
+                # IT桔子公司链接是相对路径，如 /company/18092，不包含域名
+                if "/company/" in href:
                     name = (a.text_content() or "").strip()
                     if not name or len(name) < 2:
                         continue

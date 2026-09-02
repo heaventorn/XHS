@@ -59,11 +59,13 @@ DELAY_BETWEEN_COMPANIES = (8.0, 15.0)
 
 
 def _is_logged_in(page):
-    """登录检测：访问搜索页 URL，若跳转到 weblogin 说明未登录。"""
+    """登录检测：只检查当前页面 URL，不发起导航（避免与登录页 goto 冲突导致死循环刷新）。
+    about:blank / 空 URL / weblogin 登录页均视为未登录。"""
     try:
-        page.goto(SEARCH_URL.format("测试"), wait_until="domcontentloaded", timeout=30000)
-        human_sleep((1.5, 3.0))
-        return "weblogin" not in page.url
+        url = page.url or ""
+        if not url or "about:blank" in url:
+            return False
+        return "weblogin" not in url
     except Exception:
         return False
 
@@ -105,7 +107,8 @@ class QCCCrawler:
                 print("检测到未登录！请在弹出浏览器中扫码 / 微信 / 短信登录")
                 print("脚本会自动检测登录状态，登录成功后自动继续...")
                 print("!" * 50)
-                page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=30000)
+                page.goto(LOGIN_PAGE, wait_until="load", timeout=60000)
+                time.sleep(2)  # 等待扫码二维码/登录按钮渲染完成
                 waited = 0
                 while waited < login_timeout:
                     time.sleep(3)
@@ -168,6 +171,7 @@ class QCCCrawler:
         # 3. 进详情页
         page.goto(pick["href"], wait_until="domcontentloaded", timeout=45000)
         human_sleep(H.DELAY_PAGE_LOAD)
+        self._close_popups(page)  # 关闭广告弹窗（避免遮挡内容）
         if random.random() < 0.5:
             random_hover(page)
         if random.random() < 0.3:
@@ -182,7 +186,7 @@ class QCCCrawler:
             print(f"  [企查查] 「{company}」详情页未提取到有效字段，跳过。")
             return
 
-        row = self._to_contact_row(info, company)
+        row = self._to_contact_row(info, company, pick["name"])
         self.rows.append(row)
         print(f"  [企查查] 「{pick['name']}」→ 电话 {row['联系电话'] or '无'} / 邮箱 {row['公司邮箱'] or '无'}")
 
@@ -209,18 +213,27 @@ class QCCCrawler:
     def _extract_detail(self, page):
         """详情页提取：顶部 rline 区（电话/邮箱/官网/信用代码/法人）+ 基本信息表。"""
         info = {}
-        # ---- 顶部信息区 .rline：label:值 ----
+        # ---- 顶部信息区 .rline：用完整文本解析 label:value（不依赖子元素结构）----
+        _noise = ("复制", "更多", "关联企业", "附近企业", "公众号", "所属行业", "国标行业",
+                   "企查查行业", "企业规模", "员工人数", "营业收入", "展开", "收起")
         try:
             rlines = page.query_selector_all(".normal-company-info-part .rline")
             for row in rlines:
                 try:
-                    le = row.query_selector("span.f .need-copy-field")
-                    ve = row.query_selector("span.val")
-                    if not le:
+                    raw = (row.text_content() or "").strip()
+                    if not raw or "：" not in raw:
                         continue
-                    label = (le.text_content() or "").strip().rstrip("：:")
-                    val = (ve.text_content() or "").strip() if ve else ""
-                    if label and val:
+                    # 按第一个全角冒号分割
+                    parts = raw.split("：", 1)
+                    label = parts[0].strip().rstrip(":")
+                    val = parts[1].strip() if len(parts) > 1 else ""
+                    # 清理噪音词
+                    for n in _noise:
+                        val = val.replace(n, "")
+                    # 清理数字后缀（如"更多 1""附近企业 更多 1"）
+                    import re as _re
+                    val = _re.sub(r'\s+\d+\s*$', '', val).strip()
+                    if label and val and len(label) < 20:
                         info[label] = val
                 except Exception:
                     continue
@@ -249,6 +262,35 @@ class QCCCrawler:
 
         return info
 
+    def _close_popups(self, page):
+        """关闭企查查详情页的广告弹窗（新人优惠/APP下载/会员推广等）。"""
+        try:
+            # 1. 点击常见关闭按钮
+            close_selectors = [
+                ".modal-close", ".close", ".btn-close",
+                "[class*='close-btn']", "[class*='Close']",
+                ".qcc-modal .close", ".ant-modal-close",
+            ]
+            for sel in close_selectors:
+                try:
+                    els = page.query_selector_all(sel)
+                    for el in els:
+                        if el.is_visible():
+                            el.click()
+                            time.sleep(0.5)
+                except Exception:
+                    continue
+            # 2. 按 ESC 键关闭弹窗
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+            # 3. 点击页面左上角空白处（有时候点击外部可关闭）
+            try:
+                page.mouse.click(10, 10)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _has_verify(self, page):
         """检测是否触发安全验证（页面标题含验证/安全）。"""
         try:
@@ -274,10 +316,14 @@ class QCCCrawler:
         print("  等待验证超时，跳过该公司。")
 
     # ---------- 结果映射 ----------
-    def _to_contact_row(self, info, company):
+    def _to_contact_row(self, info, company, firm_name=""):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 法人清理：去掉"关联企业 N"等后缀
+        legal = info.get("法定代表人", "")
+        import re as _re
+        legal = _re.sub(r'\s*关联企业\s*\d+', '', legal).strip()
         return {
-            "公司名": info.get("企业名称") or company,
+            "公司名": firm_name or info.get("企业名称") or company,
             "统一社会信用代码": info.get("统一社会信用代码", ""),
             "所属板块": "",  # 由主程序按搜索关键词/来源补，或后续人工填
             "融资轮次": "",  # 企查查创投库在独立 tab，后续可扩展

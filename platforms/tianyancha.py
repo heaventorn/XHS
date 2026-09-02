@@ -63,13 +63,21 @@ _URL_RE = re.compile(r"(?:https?://)?(?:www\.)?[a-zA-Z0-9][-a-zA-Z0-9]{0,62}(?:\
 
 
 def _is_logged_in(page):
-    """登录检测：访问搜索页，若页面含'登录/注册'且无用户信息则视为未登录。
-    天眼查未登录也能搜索，所以这里用宽松检测：详情页电话是否脱敏不影响，
-    只要能访问搜索页即视为可用（未登录也可采集部分字段）。"""
+    """登录检测：访问搜索页，若被重定向到登录页或页面含'登录/注册'则视为未登录。
+    天眼查现在未登录会被重定向到登录页，必须登录才能采集。"""
     try:
         page.goto(SEARCH_URL.format("测试公司"), wait_until="domcontentloaded", timeout=30000)
         human_sleep((1.5, 3.0))
-        # 未登录也能访问，返回 True（登录态可选，登录后电话更完整）
+        # 被重定向到登录页，说明未登录
+        if "login" in page.url:
+            return False
+        # 页面内容含"登录/注册"且无用户信息，说明未登录
+        try:
+            txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            if "登录/注册" in txt and "我的" not in txt and "退出" not in txt:
+                return False
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -98,11 +106,10 @@ class TianyanchaCrawler:
 
         with sync_playwright() as p:
             context, used_channel = launch_browser_context(p, PROFILE_DIR, viewport=H.VIEWPORT)
-            network.install_resource_route(context)
+            # 天眼查用纯净浏览器：不注入 stealth、不拦截资源，避免登录页二维码加载失败/无法交互
             page = context.pages[0] if context.pages else context.new_page()
-            real_ua = network.prepare_context(context, page, S.build_stealth_script, "")
 
-            # 登录检测（天眼查未登录也可用，这里仅尝试建立登录态，不强制）
+            # 登录检测（天眼查现在未登录会被重定向到登录页，必须登录）
             if not _is_logged_in(page):
                 print("\n检测到访问异常，尝试引导登录...")
                 page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=30000)
@@ -270,19 +277,38 @@ class TianyanchaCrawler:
 
     @staticmethod
     def _extract_label_value(text, label):
-        """从文本中提取「label：值」或「label 值」格式的值部分。
+        """从文本中提取「label：值」或「label：\n值」格式的值部分。
+        支持值在换行后的情况（天眼查详情页很多字段值在次行）。
         取 label 后到下一个已知标签/换行前的文本。"""
-        # 匹配 label 后跟冒号或空格，然后取值（到下一个常见标签或换行）
-        pattern = re.escape(label) + r"[：:\s]+([^\n\r]{1,100}?)(?=\s{2,}|[\u4e00-\u9fa5]{2,6}[：:]|$)"
-        m = re.search(pattern, text)
-        if m:
-            val = m.group(1).strip()
-            # 过滤掉值中混入的下一个标签
-            for stop in ["法定代表人", "注册资本", "成立日期", "电话", "邮箱", "地址", "网址", "国标行业", "企业规模", "统一社会信用代码"]:
+        STOP_WORDS = ["法定代表人", "注册资本", "成立日期", "电话", "邮箱", "地址", "网址",
+                       "国标行业", "企业规模", "统一社会信用代码", "关联企业", "更多",
+                       "附近企业", "同电话企业", "公众号", "员工人数", "简介", "企业集团"]
+
+        def _clean(val):
+            """清理值：去掉混入的下一个标签和噪音词。"""
+            val = val.strip()
+            for stop in STOP_WORDS:
                 idx = val.find(stop)
                 if idx > 0:
                     val = val[:idx].strip()
             return val
+
+        # 1. 先尝试同行匹配：label：值（值在同一行）
+        pattern = re.escape(label) + r"[：:]\s*([^\n\r]{1,100}?)(?=\s{2,}|[\u4e00-\u9fa5]{2,6}[：:]|$)"
+        m = re.search(pattern, text)
+        if m:
+            val = _clean(m.group(1))
+            if val and len(val) >= 1:
+                return val
+
+        # 2. 跨行匹配：label：\n值（值在次行，天眼查常见格式）
+        pattern2 = re.escape(label) + r"[：:]\s*\n\s*([^\n\r]{1,100}?)(?=\n|$)"
+        m2 = re.search(pattern2, text)
+        if m2:
+            val = _clean(m2.group(1))
+            if val and len(val) >= 1:
+                return val
+
         return ""
 
     def _has_verify(self, page):
