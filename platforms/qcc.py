@@ -35,6 +35,7 @@ from core import humanize as H
 from core import network
 from core import stealth as S
 from core.browser import launch_browser_context
+from config import settings
 
 human_sleep = H.human_sleep
 move_mouse_human = H.move_mouse_human
@@ -50,8 +51,8 @@ LOGIN_PAGE = "https://www.qcc.com/weblogin"
 # 持久化登录态目录（保存 cookies，登录一次复用）
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".qcc_scraper_profile")
 
-# 待查询公司（也可运行时 --company 传入）
-COMPANY_QUERIES = []
+# 待查询公司（从 settings.TARGET_COMPANIES 读取，也可运行时 --company 传入覆盖）
+COMPANY_QUERIES = settings.TARGET_COMPANIES
 
 # 公司间延迟（低频，企查查风控较严）
 DELAY_BETWEEN_COMPANIES = (8.0, 15.0)

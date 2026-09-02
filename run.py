@@ -80,11 +80,10 @@ def main():
 
     # ---- 4. 汇总聚合：去重 + 公司识别 + 按公司聚合 ----
     clue_rows, contact_rows = aggregate.merge_platform_results(results)
-    if clue_rows:
-        print(f"[汇总] 跨平台去重后线索 {len(clue_rows)} 条，识别出公司 {len(contact_rows)} 家")
-    else:
-        print("[汇总] 未采集到有效线索，不生成 Excel。")
+    if not clue_rows and not contact_rows:
+        print("[汇总] 未采集到有效数据，不生成 Excel。")
         return 0
+    print(f"[汇总] 跨平台去重后线索 {len(clue_rows)} 条，识别出公司 {len(contact_rows)} 家")
 
     # ---- 5. 双层 EXCEL 落盘 ----
     out = os.path.join(settings.OUTPUT_DIR,

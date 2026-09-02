@@ -118,8 +118,9 @@ def aggregate_by_company(clue_rows):
     companies = {}
     for r in clue_rows:
         company = (str(r.get("关联公司") or "").strip()) or "未归类"
-        info = companies.setdefault(company, {
-            "公司名": company,
+        norm = _normalize_company_name(company) or company
+        info = companies.setdefault(norm, {
+            "公司名": company,  # 用第一个遇到的原始显示名
             "来源平台": [],
             "线索数": 0,
             "联系方式": [],
@@ -165,12 +166,34 @@ def aggregate_by_company(clue_rows):
     return contact_rows
 
 
+# ---------- 公司名归一化 ----------
+def _normalize_company_name(name):
+    """归一化公司名用于匹配：去括号内容、去常见后缀、去空格特殊符、转小写。
+
+    例："字节跳动有限公司" → "字节跳动"
+        "北京字节跳动科技有限公司" → "北京字节跳动科技"
+    仅用于匹配 key，显示仍用原始名。
+    """
+    if not name:
+        return ""
+    n = str(name).strip().lower()
+    n = re.sub(r"[（(].*?[)）]", "", n)  # 去括号及内容
+    # 去常见后缀（从长到短，避免短后缀先匹配）
+    for suffix in ["股份有限公司", "有限责任公司", "集团有限公司", "有限公司",
+                   "股份公司", "集团", "公司"]:
+        if n.endswith(suffix):
+            n = n[:-len(suffix)]
+            break
+    n = re.sub(r"[\s\-_·&]", "", n)  # 去空格和特殊符
+    return n
+
+
 # ---------- 汇总入口 ----------
 # 平台 → 输出通道：
 #   线索平台（社交）→ 线索池（帖子/账号，联系方式待人工补）
 #   联系平台（工商）→ 联系池（直接拿到电话/邮箱）
-CLUE_PLATFORMS = ("xhs", "zhihu", "bilibili", "weibo", "douyin", "baidu")
-CONTACT_PLATFORMS = ("qcc", "tianyancha", "aiqicha")
+CLUE_PLATFORMS = ("xhs", "zhihu", "bilibili", "weibo", "douyin", "baidu", "maimai")
+CONTACT_PLATFORMS = ("qcc", "tianyancha", "aiqicha", "itjuzi")
 
 
 def merge_platform_results(results):
@@ -206,14 +229,52 @@ def merge_platform_results(results):
 
 
 def _merge_contact(contact_src, clue_contact):
-    """合并联系池：以「公司名」为键。工商平台行优先，线索档案补充。"""
-    by_name = {}
+    """合并联系池：以「归一化公司名」为键，支持包含关系匹配（短名包含于长名视为同一家）。
+    工商平台行优先，线索档案补充空字段。"""
+    by_name = {}       # norm_key -> row
+    norm_list = []     # 已有的 norm_key 列表（用于包含匹配查找）
+
+    def _find_match(norm):
+        """查找已有归一化名：精确匹配，或短名包含于长名（短名长度>=4，避免误匹配）。"""
+        if norm in by_name:
+            return norm
+        for existing in norm_list:
+            if len(norm) >= 4 and norm in existing:
+                return existing
+            if len(existing) >= 4 and existing in norm:
+                return existing
+        return None
+
+    def _merge_fields(target, source):
+        """把 source 中非空字段合并到 target（仅填充 target 的空字段）。"""
+        for k, v in source.items():
+            if v and not target.get(k):
+                target[k] = v
+
+    # 工商平台行优先
     for r in contact_src:
         name = str(r.get("公司名") or "").strip()
-        if name:
-            by_name.setdefault(name, r)
+        if not name:
+            continue
+        norm = _normalize_company_name(name) or name
+        match = _find_match(norm)
+        if match:
+            _merge_fields(by_name[match], r)
+        else:
+            by_name[norm] = dict(r)
+            norm_list.append(norm)
+
+    # 线索档案补充
     for r in clue_contact:
         name = str(r.get("公司名") or "").strip()
-        if name and name not in by_name:
-            by_name[name] = r
+        if not name:
+            continue
+        norm = _normalize_company_name(name) or name
+        match = _find_match(norm)
+        if not match:
+            by_name[norm] = dict(r)
+            norm_list.append(norm)
+        else:
+            _merge_fields(by_name[match], r)
+
     return list(by_name.values())
