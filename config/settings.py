@@ -22,10 +22,11 @@ OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
 OUTPUT_PREFIX = "大爬虫采集结果"
 
 # ==================== 平台开关 ====================
-# 按需启用的采集器（True=启用）。新增平台后在此追加。
+# 按需启用的采集器（True=启用）。每个启用平台 = 一个并行 Worker 进程。
+# 新增平台：在 platforms/ 下创建 <name>.py（run() 返回行列表 + --output 支持），并在此追加。
 ENABLED_PLATFORMS = {
-    "xhs": True,     # 小红书（线索池）
-    # "qcc": False,  # 企查查（联系池，待开发）
+    "xhs": True,     # 小红书（线索池：帖子/账号，联系方式留空待人工补）
+    # "qcc": True,   # 企查查（联系池：工商电话/邮箱，当前为骨架，数据采集待开发）
     # "zhihu": False,
     # "bilibili": False,
 }

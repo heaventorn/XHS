@@ -12,13 +12,15 @@
   autothrottle— 自适应节流（被限自动退避 / 提速）
   checkpoint  — 断点续爬 + 流式导出
   proxy       — 代理轮换 / 多 session 支持
+  worker      — 多进程并行采集框架（平台 Worker 隔离运行）
+  aggregate   — 汇总聚合层（跨平台去重 / 按公司聚合）
 """
 from . import (
     auth, stealth, humanize, network, extract, blacklist, storage,
-    adaptive, autothrottle, checkpoint, proxy,
+    adaptive, autothrottle, checkpoint, proxy, worker, aggregate,
 )
 
 __all__ = [
     "auth", "stealth", "humanize", "network", "extract", "blacklist", "storage",
-    "adaptive", "autothrottle", "checkpoint", "proxy",
+    "adaptive", "autothrottle", "checkpoint", "proxy", "worker", "aggregate",
 ]

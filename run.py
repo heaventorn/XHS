@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""大爬虫框架 · 主入口
+"""大爬虫框架 · 主入口（多进程并行版）
 
 流程：
   1. 双密码验证（手动访问密码 + 本地 pwd.key 强密码，Argon2 双校验）
-  2. 按 config/settings.py 启用的平台依次运行采集器
-  3. 汇总为双层 EXCEL：
+  2. 并行启动启用的平台采集器 Worker（每个平台一个独立进程，互不干扰）
+  3. 等待全部完成，实时转发各平台日志
+  4. 汇总聚合层：跨平台去重 + 公司名识别 + 按公司聚合
+  5. 落盘双层 EXCEL：
        Sheet1 线索池（社交平台：帖子/账号，联系方式留空待人工补）
-       Sheet2 联系池（工商数据：直接拿到电话/邮箱）
+       Sheet2 联系池（按公司聚合的档案；企查查 Worker 可回填工商字段）
 
 用法：
   直接运行 run.py（会先弹密码框）
@@ -22,7 +24,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from config import settings
-from core import auth, storage
+from core import auth, storage, worker, aggregate
 
 
 def verify_password():
@@ -36,22 +38,15 @@ def verify_password():
     return gate.run(title="大爬虫框架 · 身份验证", prompt="请输入访问密码")
 
 
-def load_crawlers():
-    """按配置加载启用的平台采集器，返回 [(名称, 实例)]。"""
-    crawlers = []
-    if settings.ENABLED_PLATFORMS.get("xhs"):
-        from platforms.xhs import XHSCrawler
-        crawlers.append(("xhs", XHSCrawler()))
-    # 未来新增平台在此追加
-    # if settings.ENABLED_PLATFORMS.get("qcc"):
-    #     from platforms.qcc import QCCCrawler
-    #     crawlers.append(("qcc", QCCCrawler()))
-    return crawlers
+def get_enabled_platforms():
+    """返回配置中启用的平台名列表（保持配置顺序）。"""
+    return [name for name, enabled in settings.ENABLED_PLATFORMS.items() if enabled]
 
 
 def main():
     print("=" * 60)
     print("  大爬虫框架 · 多渠道找 CFO/融资负责人")
+    print("  （多进程并行采集 → 按公司聚合）")
     print("=" * 60)
 
     # ---- 1. 双密码验证 ----
@@ -60,39 +55,43 @@ def main():
         return 1
     print("[√] 双密码验证通过，开始运行...\n")
 
-    # ---- 2. 运行各平台采集器 ----
-    crawlers = load_crawlers()
-    if not crawlers:
+    # ---- 2. 并行启动平台 Worker ----
+    platforms = get_enabled_platforms()
+    if not platforms:
         print("错误：config/settings.py 中未启用任何平台采集器。")
         return 1
 
-    all_clue_rows = []
-    all_contact_rows = []
+    print(f"[并行] 启用的平台：{platforms}（每个平台一个独立进程）\n")
 
-    for name, crawler in crawlers:
-        print(f"\n{'=' * 60}\n开始采集平台：{crawler.platform}\n{'=' * 60}")
-        try:
-            rows = crawler.run()
-            if name == "xhs":
-                # 小红书 → 线索池（需要人工补联系方式）
-                all_clue_rows.extend(rows)
-                print(f"小红书采集完成，线索 {len(rows)} 条（去重后累计 {len(all_clue_rows)} 条）")
-            # elif name == "qcc":
-            #     all_contact_rows.extend(rows)
-        except Exception as e:
-            print(f"[!] 平台 {crawler.platform} 采集失败：{e}")
-            continue
+    def log(text):
+        print(text, end="", flush=True)
 
-    # ---- 3. 双层 EXCEL 落盘 ----
-    if not all_clue_rows and not all_contact_rows:
-        print("\n本次未采集到任何数据，不生成 Excel。")
+    workers = worker.spawn_platform_workers(platforms, log_cb=log)
+    if not workers:
+        print("\n[!] 所有平台 Worker 启动失败，请检查 platforms/ 下采集器是否存在。")
+        return 1
+
+    # ---- 3. 等待全部完成并收集 ----
+    print("\n[并行] 各平台 Worker 已启动，等待采集完成...\n")
+    results = worker.wait_and_collect(workers, log_cb=log)
+
+    total = sum(len(v) for v in results.values())
+    print(f"\n[汇总] 各平台原始采集合计 {total} 条，进入聚合环节...")
+
+    # ---- 4. 汇总聚合：去重 + 公司识别 + 按公司聚合 ----
+    clue_rows, contact_rows = aggregate.merge_platform_results(results)
+    if clue_rows:
+        print(f"[汇总] 跨平台去重后线索 {len(clue_rows)} 条，识别出公司 {len(contact_rows)} 家")
+    else:
+        print("[汇总] 未采集到有效线索，不生成 Excel。")
         return 0
 
+    # ---- 5. 双层 EXCEL 落盘 ----
     out = os.path.join(settings.OUTPUT_DIR,
                        f"{settings.OUTPUT_PREFIX}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
-    storage.save_two_sheets(out, clue_rows=all_clue_rows, contact_rows=all_contact_rows)
+    storage.save_two_sheets(out, clue_rows=clue_rows, contact_rows=contact_rows)
     print(f"\n[√] 已保存到：{out}")
-    print(f"    线索池 {len(all_clue_rows)} 条 / 联系池 {len(all_contact_rows)} 条")
+    print(f"    线索池 {len(clue_rows)} 条 / 联系池 {len(contact_rows)} 家")
     return 0
 
 

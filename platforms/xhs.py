@@ -680,20 +680,41 @@ class XHSCrawler:
 
 
 def main():
-    """命令行直跑（用于测试单个平台）。"""
+    """命令行直跑（用于测试单个平台 / worker 并行模式）。"""
+    import argparse
+    parser = argparse.ArgumentParser(description="小红书平台采集器")
+    parser.add_argument("--output", default="", help="结果 JSON 输出路径（worker 并行模式）")
+    parser.add_argument("--keywords", default="", help="覆盖关键词（逗号分隔）")
+    parser.add_argument("--max-per-keyword", type=int, default=0, help="覆盖每词采集上限")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("小红书平台采集器（框架版）")
     print("=" * 60)
-    print(f"关键词列表：{KEYWORDS}（顺序每次随机打乱）")
-    print(f"每个关键词最多采集：{MAX_PER_KEYWORD} 条（实际随机浮动）")
+    if args.keywords:
+        print(f"覆盖关键词：{args.keywords}")
+    else:
+        print(f"关键词列表：{KEYWORDS}（顺序每次随机打乱）")
+    print(f"每个关键词最多采集：{args.max_per_keyword or MAX_PER_KEYWORD} 条（实际随机浮动）")
     print(f"单次总采集上限：{MAX_TOTAL_NOTES} 条")
     print(f"代理：{PROXY_URL or '直连（本机 IP）'}")
     print("=" * 60)
 
-    crawler = XHSCrawler()
+    kwargs = {}
+    if args.keywords:
+        kwargs["keywords"] = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    if args.max_per_keyword:
+        kwargs["max_per_keyword"] = args.max_per_keyword
+    crawler = XHSCrawler(**kwargs)
     rows = crawler.run()
 
-    if rows:
+    if args.output:
+        import json as _json
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            _json.dump(rows, f, ensure_ascii=False, indent=1)
+        print(f"结果已写入：{args.output}（{len(rows)} 条）")
+    elif rows:
         from core.storage import save_two_sheets
         out = os.path.join(os.path.expanduser("~"), "Desktop",
                            f"小红书线索_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")

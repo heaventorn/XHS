@@ -5,14 +5,16 @@
 
 
 BLACKLIST_AUTHORS = [
-    # "账号昵称1",
-    # "账号昵称2",
+    "找FA",
+    "duck side of moon",
 ]
 
 
 BLACKLIST_IDS = [
     "109181692",
     "49292951005",
+    "57c39e326a6a6921178b99dc",
+    "6a83fa500000000013031801",
 ]
 
 
